@@ -177,6 +177,7 @@ static void formatTzOffset(char* out, size_t n) {
 }
 
 static bool flushVerbose = false;
+static bool flushDebug = false;
 
 static uint64_t lastProcessedSampleEpochMs = 0;
 static uint64_t lastSummaryPrintedEpochMs = 0;
@@ -212,7 +213,7 @@ CurrentSensorMode currentMode = MODE_ADS_ONLY;
 unsigned long lastSampleMs = 0;
 unsigned long lastRtcSyncMs = 0;
 const unsigned long SAMPLE_INTERVAL_MS = 1000;
-const unsigned long RTC_RESYNC_INTERVAL_MS = 10UL * 60UL * 1000UL;
+const unsigned long RTC_RESYNC_INTERVAL_MS = 15UL * 60UL * 1000UL; // 15 mins
 
 bool gnssFixAvailable = false;
 static uint32_t loopIteration = 0;
@@ -221,7 +222,7 @@ static unsigned long lastSampleTriggerMs = 0;
 static const unsigned long GNSS_QUERY_INTERVAL_MS = 100;
 static uint64_t pendingSampleEpochMs = 0;
 static unsigned long sampleReadyAtMs = 0;
-static const unsigned long SAMPLE_BUILD_DELAY_MS = 400;
+static const unsigned long SAMPLE_READY_DELAY_MS = 500; // wait half a second post-rollover before building the sample
 
 HardwareSerial lteSerial(1);
 
@@ -266,10 +267,11 @@ struct PendingSend {
   Sample sample;
   bool haveSample;
 };
-static const size_t MAX_PENDING_SENDS = 16;
+static const size_t MAX_PENDING_SENDS = 64;
 static PendingSend pendingQ[MAX_PENDING_SENDS];
 static size_t pendingQHead = 0, pendingQTail = 0, pendingQCount = 0;
 static size_t pendingMainCount = 0;
+static const unsigned long PENDING_MAIN_TIMEOUT_MS = 60000;
 
 static bool pendingQIsFull(){ return pendingQCount >= MAX_PENDING_SENDS; }
 static bool pendingQIsEmpty(){ return pendingQCount == 0; }
@@ -325,9 +327,9 @@ static bool pendingQPushBacklog(const char* path, const String &line, unsigned l
 }
 
 struct BacklogRemoval { bool active; char path[40]; String line; };
-static BacklogRemoval backlogDone[16];
+static BacklogRemoval backlogDone[MAX_PENDING_SENDS];
 static void recordBacklogRemoval(const char* path, const String &line){
-  for (size_t i=0;i<16;i++){ if (!backlogDone[i].active){ backlogDone[i].active=true; strncpy(backlogDone[i].path, path?path:"", sizeof(backlogDone[i].path)); backlogDone[i].path[sizeof(backlogDone[i].path)-1]='\0'; backlogDone[i].line=line; break; } }
+  for (size_t i=0;i<MAX_PENDING_SENDS;i++){ if (!backlogDone[i].active){ backlogDone[i].active=true; strncpy(backlogDone[i].path, path?path:"", sizeof(backlogDone[i].path)); backlogDone[i].path[sizeof(backlogDone[i].path)-1]='\0'; backlogDone[i].line=line; break; } }
 }
 
 static bool backlogAppend(const String &hexPayload, uint64_t epochMs);
@@ -522,9 +524,9 @@ void setup() {
   Serial.flush();
   delay(10);
   printResetInfo();
-  setupSensors();
-  setupStorage();
-  initAppState();
+  setupSensors();  // all sensors
+  setupStorage(); // sd
+  initAppState(); //reset vars
 }
 
 void loop() {
@@ -533,28 +535,30 @@ void loop() {
   int time_0 = millis();
   if (lteSerialRxPending) {
 
-    pumpModemUrc(5);
+    pumpModemUrc(5); // check if we have received any urc data e.g., LTE pub success
     lteSerialRxPending = false;
   }
   int time_1 = millis();
 
-  pollGnssTime();
+  pollGnssTime(); // check gnss or rtc time
   int  time_2 = millis();
 
-  processSample();
+  processSample(); // if 500ms past rollover aggregate; pub therafter
   int  time_3 = millis();
 
-  servicePendingTimeouts();
+  servicePendingTimeouts();  // correspond the latest urc status to the oldest unresolved lte publish: store on sd with lte_flag based on fail/succ and also append to backlog if failed
   int  time_4 = millis();
 
-  readSensors();
+  readSensors(); // read all sensors - excludes gnss 
    int time_5 = millis();
 
-  testCSQ();
+  testCSQ(); // test whether csq is 
   int  time_6 = millis();
 
-  ResyncRTC();
+  ResyncRTC(); // resync if on startup or 15 minutes
   int  time_7 = millis();
+
+  flushBacklog(); // if time and quantity limit not exceeded, flush. 
 
 }
 
@@ -800,6 +804,7 @@ static void pollGnssTime() {
     sampleTickPending = true;
     pendingSampleEpochMs = epochMs;
     lastSampleTriggerMs = now;
+    sampleReadyAtMs = lastSampleTriggerMs + SAMPLE_READY_DELAY_MS;
     lastScheduledSampleEpochMs = epochMs;
     return true;
   };
@@ -818,7 +823,7 @@ static void pollGnssTime() {
     if (!aggregator.gnssValid || !lastRmcFixValid) {
       uint32_t epoch = ensureRtcEpoch();
       if (epoch > 0) {
-        if (tryScheduleSample((uint64_t)epoch * 1000ULL)) {
+        if (tryScheduleSample((uint64_t)epoch * 1000ULL)) { // check if its 500ms post-rollover
           aggregator.gnssValid = false;
           gnssFixAvailable = false;
           if (debugTrace) {
@@ -972,9 +977,9 @@ static void printLteSummaryIfNeeded() {
   size_t flushed = flushRanRecent ? flushSentRecent : 0;
   size_t pending = flushRanRecent ? flushPendingRecent : 0;
   size_t failed  = flushRanRecent ? flushFailedRecent : 0;
-  Serial.printf("[LTE] backlog=%d main=%c %lums flush=%uT/%uP/%uF %lums\n",
-                backlogExistsNow ? 1 : 0, mainChar, mainMs,
-                (unsigned)flushed, (unsigned)pending, (unsigned)failed, flushMs);
+  // Serial.printf("[LTE] backlog=%d main=%c %lums flush=%uT/%uP/%uF %lums\n",
+  //               backlogExistsNow ? 1 : 0, mainChar, mainMs,
+  //               (unsigned)flushed, (unsigned)pending, (unsigned)failed, flushMs);
   lastSummaryPrintedEpochMs = lastProcessedSampleEpochMs;
 
   flushRanRecent = false;
@@ -1002,21 +1007,48 @@ static void flushBacklog() {
   unsigned long now = millis();
   if (backlogFlushDueMs == 0) {
     backlogFlushDueMs = lastSampleMs + 850;
+    if (flushDebug && debugTrace) {
+      Serial.printf("[FLUSHDBG] schedule first flush at %lu (now=%lu)\n", backlogFlushDueMs, now);
+    }
   }
   if (now < backlogFlushDueMs) {
+    if (flushDebug && debugTrace) {
+      Serial.printf("[FLUSHDBG] skip: now<due (%lu<%lu)\n", now, backlogFlushDueMs);
+    }
     return;
   }
   if ((now - lastSampleMs) > 750UL) {
-    backlogFlushDueMs += SAMPLE_INTERVAL_MS;
-    return;
+    bool backlogLikely = backlogTodayExistsQuick(lastProcessedSampleEpochMs);
+    if (pendingQIsEmpty() && !backlogLikely) {
+      backlogFlushDueMs += SAMPLE_INTERVAL_MS;
+      if (flushDebug && debugTrace) {
+        Serial.printf("[FLUSHDBG] defer: inactive window (Δ=%lu, no backlog/pending)\n", now - lastSampleMs);
+      }
+      return;
+    }
+    if (flushDebug && debugTrace) {
+      Serial.printf("[FLUSHDBG] continuing despite inactive window (Δ=%lu backlog=%d pending=%d)\n",
+                    now - lastSampleMs, backlogLikely ? 1 : 0, pendingQIsEmpty() ? 0 : 1);
+    }
   }
   backlogFlushDueMs += SAMPLE_INTERVAL_MS;
+  if (flushDebug && debugTrace) {
+    Serial.printf("[FLUSHDBG] running at %lu nextDue=%lu\n", now, backlogFlushDueMs);
+  }
 
   servicePendingTimeouts();
   if (syncNeeded()) {
+    if (flushDebug && debugTrace) {
+      Serial.println("[FLUSHDBG] syncNeeded -> syncWithCloud");
+    }
     syncWithCloud();
+  } else if (flushDebug && debugTrace) {
+    Serial.println("[FLUSHDBG] syncNeeded false — no flush");
   }
   if (lteSerialRxPending) {
+    if (flushDebug && debugTrace) {
+      Serial.println("[FLUSHDBG] pumpModemUrc due to pending RX");
+    }
     pumpModemUrc(1);
     lteSerialRxPending = false;
   }
@@ -1257,7 +1289,7 @@ void pumpModemUrc(unsigned long budgetMs) {
               }
               if (debugTrace) {
                 unsigned long age = mqttAttemptMs ? (millis() - mqttAttemptMs) : 0;
-                Serial.printf("[MQTTURC] SUCCESS (pump) age=%lums\n", age);
+                // Serial.printf("[MQTTURC] SUCCESS (pump) age=%lums\n", age);
               }
               f->line = "";
               f->sampleEpochMs = 0;
@@ -1495,6 +1527,10 @@ static bool ensureLTEConnected(){
 
 static bool publishHexPayload(const String &hexPayload, const String &fallbackHex, const Sample &sample) {
   if (!lteDetected) { lastMqttOk = false; mqttPending = (pendingMainCount > 0); return false; }
+  if (pendingQIsFull()) {
+    if (debugTrace) Serial.println("[MQTT] Pending queue full — skipping publish");
+    return false;
+  }
 
   if (!lteSignalSufficient(true, "publish precheck")) {
     lastMqttOk = false; mqttPending = (pendingMainCount > 0); return false;
@@ -1518,6 +1554,10 @@ static bool publishHexPayload(const String &hexPayload, const String &fallbackHe
   (void)r;
   lastMqttOk = false;
   mqttAttemptMs = millis();
+  if (!pendingQPushMain(mqttAttemptMs, PENDING_MAIN_TIMEOUT_MS, fallbackHex, sample)) {
+    if (debugTrace) Serial.println("[MQTT] Pending queue full — dropping to backlog");
+    return false;
+  }
 
   lastMainAttemptValid = true;
   lastMainAttemptMs = mqttAttemptMs;
@@ -1528,7 +1568,10 @@ static bool publishHexPayload(const String &hexPayload, const String &fallbackHe
 static bool publishHexPayloadBacklogEnqueue(const char* path, const String &lineHex) {
   if (!lteDetected) { if (debugTrace) Serial.println("[FLUSH] LTE not detected"); return false; }
   if (!lteMqttReady) { if (debugTrace) Serial.println("[FLUSH] MQTT not ready"); return false; }
-
+  if (pendingQIsFull()) {
+    if (debugTrace) Serial.println("[FLUSH] Pending queue full — deferring backlog publish");
+    return false;
+  }
   if (!lteSignalSufficient(true, "backlog publish")) {
     if (debugTrace) Serial.println("[FLUSH] CSQ gate blocked backlog publish");
     return false;
@@ -1536,7 +1579,13 @@ static bool publishHexPayloadBacklogEnqueue(const char* path, const String &line
   char atCmd[800];
   snprintf(atCmd, sizeof(atCmd), "AT+UMQTTC=2,1,0,1,\"%s\",\"%s\"", MQTT_PUB_TOPIC, lineHex.c_str());
   (void)sendCmd(atCmd, 500, 1);
-  (void)pendingQPushBacklog(path, lineHex, millis(), 3000);
+  if (!pendingQPushBacklog(path, lineHex, millis(), 3000)) {
+    if (debugTrace) Serial.println("[FLUSH] Pending queue push failed — keeping backlog entry");
+    return false;
+  }
+  if (debugTrace) {
+    Serial.printf("[FLUSH] Backlog publish queued: %s\n", path ? path : "(unknown)");
+  }
   return true;
 }
 
@@ -2519,9 +2568,11 @@ bool syncNeeded() {
   if (now < nextSyncCheckMs) return false;
   nextSyncCheckMs = now + SYNC_CHECK_INTERVAL_MS;
   if (!lteMqttReady) { if (flushVerbose && debugTrace) Serial.println("[FLUSH] Check: MQTT not ready"); return false; }
-  if (mqttPending) { if (flushVerbose && debugTrace) Serial.println("[FLUSH] Check: deferred, publish pending"); return false; }
   bool exists = backlogExists();
   if (flushVerbose && debugTrace) Serial.printf("[FLUSH] Check: backlogExists=%d\n", exists ? 1 : 0);
+  if (flushDebug && debugTrace) {
+    Serial.printf("[FLUSHDBG] syncNeeded mqttReady=%d backlog=%d\n", lteMqttReady ? 1 : 0, exists ? 1 : 0);
+  }
   return exists;
 }
 
@@ -2580,10 +2631,12 @@ static bool findOldestBacklogFile(char* outPath, size_t outLen) {
 
 static size_t flushBacklogMulti(size_t maxRecords, unsigned long budgetMs) {
   if (!sdReady || maxRecords == 0) { if (debugTrace) Serial.println("[FLUSH] Guard: sdReady/maxRecords false"); return 0; }
-  if (mqttPending) { if (debugTrace) Serial.println("[FLUSH] Deferred: publish pending"); return 0; }
 
   const unsigned long start   = millis();
   const unsigned long deadline = start + budgetMs;
+  if (flushDebug && debugTrace) {
+    Serial.printf("[FLUSHDBG] flushBacklogMulti start=%lu budget=%lu\n", start, budgetMs);
+  }
   size_t sentCount = 0;
   size_t triedCount = 0;
   size_t keptCount  = 0;
@@ -2591,7 +2644,7 @@ static size_t flushBacklogMulti(size_t maxRecords, unsigned long budgetMs) {
   size_t failCount    = 0;
   size_t lineCount  = 0;
 
-  for (size_t i=0; i<16 && (long)(deadline - millis()) > 0; i++) {
+  for (size_t i=0; i<MAX_PENDING_SENDS && (long)(deadline - millis()) > 0; i++) {
     if (!backlogDone[i].active) continue;
     char path[40]; strncpy(path, backlogDone[i].path, sizeof(path)); path[sizeof(path)-1]='\0';
     File in = SD.open(path, FILE_READ);
@@ -2628,6 +2681,9 @@ static size_t flushBacklogMulti(size_t maxRecords, unsigned long budgetMs) {
     while (in.available() && triedCount < maxRecords && (long)(deadline - millis()) > 0 && !pendingQIsFull()) {
       String line = in.readStringUntil('\n'); line.trim(); if (!line.length()) continue;
       lineCount++;
+      if (flushDebug && debugTrace) {
+        Serial.printf("[FLUSHDBG] try backlog line from %s\n", path);
+      }
 
       unsigned long nowt = millis();
       if (nowt - lastSendMs < 30) {
@@ -2636,8 +2692,20 @@ static size_t flushBacklogMulti(size_t maxRecords, unsigned long budgetMs) {
         delay(wait);
       }
       bool ok = publishHexPayloadBacklogEnqueue(path, line);
-      if (ok) { pendingCount++; triedCount++; lastSendMs = millis(); }
-      else { keptCount++; break; }
+      if (ok) {
+        pendingCount++;
+        triedCount++;
+        lastSendMs = millis();
+        if (flushDebug && debugTrace) {
+          Serial.println("[FLUSHDBG] backlog line queued");
+        }
+      } else {
+        keptCount++;
+        if (flushDebug && debugTrace) {
+          Serial.println("[FLUSHDBG] backlog enqueue failed, stopping file");
+        }
+        break;
+      }
     }
     in.close();
 
@@ -2855,4 +2923,3 @@ float convertAdsCountsToCurrent(int32_t code) {
   float v = code * ADS_LSB_V;
   return v * CURRENT_A_PER_V;
 }
-
