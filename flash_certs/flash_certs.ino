@@ -1,13 +1,10 @@
-// Arduino/ESP32 sketch for LENA-R8 LTE Cat 1bis with Vodacom APN and active-low PWR_ON
 #include <HardwareSerial.h>
 
-const int PWR_ON_PIN = 15;    // adjust per wiring
-const int RX_PIN     = 2;   // module TX -> MCU RX
-const int TX_PIN     = 1;   // module RX <- MCU TX
+const int PWR_ON_PIN = 15;
+const int RX_PIN     = 2;
+const int TX_PIN     = 1;
 
 HardwareSerial lteSerial(1);
-
-
 
 static const char AWS_CERT_CA[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -85,19 +82,10 @@ fwMyN834AOfJeFX+uOrfPDh7RL9HNZBd6zXkRAHLpIFMLuB/Y9qd0g==
 -----END RSA PRIVATE KEY-----
 )EOF";
 
-
-
-// ---------- Helper functions ----------
-
-// Send a simple AT command, wait up to timeout_ms for OK or ERROR.
-// Prints each non-empty line to Serial.
-// Returns true if “OK” seen, false otherwise.
 bool sendCmd(const char* cmd, unsigned long timeout_ms = 2000) {
-  // Send the command
   Serial.print("[AT]> "); Serial.println(cmd);
   lteSerial.print(cmd);
   lteSerial.print("\r\n");
-  
 
   unsigned long start = millis();
   String line;
@@ -109,35 +97,27 @@ bool sendCmd(const char* cmd, unsigned long timeout_ms = 2000) {
       Serial.print("<Rsp> "); Serial.println(line);
       if (line == "OK") return true;
       if (line == "ERROR") return false;
-      // else keep reading until OK/ERROR or timeout
     }
   }
-  delay(20); // just in case, not really necessary
+  delay(20);
   Serial.println("<Err> sendCmd timeout");
   return false;
 }
 
-// Send an AT command that expects a '>' prompt before sending data.
-// E.g. AT+UDWNFILE="filename",<length>
-// After seeing '>', this function writes exactly payloadLen bytes from payload.
-// Then waits for OK or ERROR up to finalTimeout_ms.
-// Returns true if OK seen, false otherwise.
 bool sendCmdWithPrompt(const char* cmd,
                        const char* payload, size_t payloadLen,
                        unsigned long promptTimeout_ms = 5000,
                        unsigned long finalTimeout_ms = 5000) {
   Serial.print("[AT]> "); Serial.println(cmd);
-  // 1) send the AT command
   lteSerial.print(cmd);
   lteSerial.print("\r\n");
 
-  // 2) wait for '>' prompt (module signals “paste now”)
   unsigned long start = millis();
   bool gotPrompt = false;
   while (millis() - start < promptTimeout_ms) {
     if (lteSerial.available()) {
       int c = lteSerial.read();
-      Serial.write(c); // echo whatever arrives; will include '>' when prompt arrives
+      Serial.write(c);
       if (c == '>') {
         gotPrompt = true;
         break;
@@ -149,17 +129,15 @@ bool sendCmdWithPrompt(const char* cmd,
     return false;
   }
 
-  // 3) send the payload bytes immediately
   Serial.println("\n[Info] Sending payload data...");
   size_t sent = 0;
   while (sent < payloadLen) {
     size_t chunk = min((size_t)256, payloadLen - sent);
     lteSerial.write((const uint8_t*)(payload + sent), chunk);
     sent += chunk;
-    delay(10); // small delay so module can process data
+    delay(10);
   }
 
-  // 4) wait for final OK or ERROR
   start = millis();
   String line;
   while (millis() - start < finalTimeout_ms) {
@@ -176,39 +154,30 @@ bool sendCmdWithPrompt(const char* cmd,
   return false;
 }
 
-// Example wrapper: store a PEM file in module filesystem via AT+UDWNFILE.
-// filename: e.g. "aws_ca.pem". pem: a null-terminated string containing the full PEM (including BEGIN/END lines).
 bool storePemFile(const char* filename, const char* pem) {
-    String delCmd = String("AT+UDELFILE=\"") + filename + "\"";
-  sendCmd(delCmd.c_str(), 2000);  // Ignore result (in case file doesn't exist)
+  String delCmd = String("AT+UDELFILE=\"") + filename + "\"";
+  sendCmd(delCmd.c_str(), 2000);
 
   size_t len = strlen(pem);
-  // Build AT command: AT+UDWNFILE="filename",<length>
   String cmd = String("AT+UDWNFILE=\"") + filename + String("\",") + String(len);
   return sendCmdWithPrompt(cmd.c_str(), pem, len);
 }
 
-// ---------- Example usage in setup ----------
-
 void setup() {
   Serial.begin(115200);
-  // Initialize module serial
   lteSerial.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(200);
 
-  // Power-on pulse (active-low), as before:
   pinMode(PWR_ON_PIN, OUTPUT);
-  digitalWrite(PWR_ON_PIN, LOW);
-  delay(600);
+  digitalWrite(PWR_ON_PIN, LOW); // power pulse
+  delay(2100);
   pinMode(PWR_ON_PIN, INPUT);
   delay(200);
 
-  // Basic AT check:
   if (!sendCmd("AT")) {
     Serial.println("[Err] Module did not respond to AT");
-    // handle error or retry...
   }
-  // Example: store certificates. You must define AWS_CERT_CA, AWS_CERT_CLIENT, AWS_CERT_PRIVATE elsewhere as null-terminated strings.
+
   if (!storePemFile("aws_ca.pem", AWS_CERT_CA)) {
     Serial.println("[Err] Failed to store aws_ca.pem");
   }
@@ -219,28 +188,20 @@ void setup() {
     Serial.println("[Err] Failed to store aws_priv.key");
   }
 
-    // --- Check files exist ---
-    // sendCmd("AT+ULSTFILE=2,\"aws_ca.pem\"");
-    sendCmd("AT+ULSTFILE=2,\"aws_client.crt\"");
-    sendCmd("AT+ULSTFILE=2,\"aws_priv.key\"");
+  sendCmd("AT+ULSTFILE=2,\"aws_client.crt\""); // list file
+  sendCmd("AT+ULSTFILE=2,\"aws_priv.key\"");   // list file
 
-    // --- Certificates manager configuration ---
-    sendCmd("AT+USECMNG=1,0,\"AWS_CA\",\"aws_ca.pem\"");
-    sendCmd("AT+USECMNG=1,1,\"AWS_Client\",\"aws_client.crt\"");
-    sendCmd("AT+USECMNG=1,2,\"Client_Key\",\"aws_priv.key\"");
+  sendCmd("AT+USECMNG=1,0,\"AWS_CA\",\"aws_ca.pem\"");       // root CA
+  sendCmd("AT+USECMNG=1,1,\"AWS_Client\",\"aws_client.crt\""); // client cert
+  sendCmd("AT+USECMNG=1,2,\"Client_Key\",\"aws_priv.key\"");   // client key
 
-    // --- Security profile configuration ---
-    sendCmd("AT+USECPRF=0,0,1");                                          // Cert validation level
-    sendCmd("AT+USECPRF=0,2,0");                                          // Cipher suite auto
-    sendCmd("AT+USECPRF=0,3,\"AWS_CA\"");                                 // Root CA
-    sendCmd("AT+USECPRF=0,5,\"AWS_Client\"");                             // Client cert
-    sendCmd("AT+USECPRF=0,6,\"Client_Key\"");                             // Client key
-    sendCmd("AT+USECPRF=0,10,\"ai6di095wqgo-ats.iot.us-east-1.amazonaws.com\""); // SNI
+  sendCmd("AT+USECPRF=0,0,1");  // validation
+  sendCmd("AT+USECPRF=0,2,0");  // cipher auto
+  sendCmd("AT+USECPRF=0,3,\"AWS_CA\"");      // CA ref
+  sendCmd("AT+USECPRF=0,5,\"AWS_Client\"");  // cert ref
+  sendCmd("AT+USECPRF=0,6,\"Client_Key\"");  // key ref
+  sendCmd("AT+USECPRF=0,10,\"ai6di095wqgo-ats.iot.us-east-1.amazonaws.com\""); // SNI
 
-    sendCmd("AT+UGGLL=1"); // GNSS related; turn on responses related to: location fix
-    sendCmd("AT+UGGLL=1");
 }
 
-void loop() {
-  // your normal loop...
-}
+void loop() {}
